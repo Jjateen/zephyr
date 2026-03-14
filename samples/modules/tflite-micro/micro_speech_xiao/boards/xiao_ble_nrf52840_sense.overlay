@@ -1,0 +1,15 @@
+/*
+ * Copyright 2025 The TensorFlow Authors. All Rights Reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Enable the onboard PDM microphone (MSM261D3526HICPM-C).
+ * Pinctrl (PDM_CLK=P1.00, PDM_DIN=P0.16) and clock-source are already
+ * defined in the board DTS; we only need to mark the peripheral as okay
+ * and expose it under the "dmic_dev" label used by the audio driver API.
+ */
+dmic_dev: &pdm0 {
+	status = "okay";
+};

@@ -1,0 +1,23 @@
+sample:
+  description: Micro Speech v4 — 10-class keyword spotter (tiny_conv_v4) for Seeed XIAO BLE Sense (nRF52840)
+  name: micro speech xiao v4
+common:
+  tags:
+    - tensorflow
+    - audio
+    - ml
+  build_only: true
+  modules:
+    - tflite-micro
+  harness: console
+  harness_config:
+    type: multi_line
+    ordered: false
+    regex:
+      - "Detected: (silence|unknown|down|go|left|off|on|right|stop|up)"
+tests:
+  sample.tensorflow.micro_speech_xiao_v4:
+    integration_platforms:
+      - xiao_ble/nrf52840/sense
+    platform_allow:
+      - xiao_ble/nrf52840/sense
