@@ -37,3 +37,27 @@ Steps to test the sample:
 - Start streaming audio (for example by playing an audio file on the HOST).
 - Start recording audio stream (for example using Audacity).
 - Verify the recorded audio stream.
+
+Measuring CPU load
+******************
+
+To measure per-thread CPU usage, add the following to your build configuration:
+
+.. code-block:: cfg
+
+   CONFIG_THREAD_ANALYZER=y
+   CONFIG_THREAD_ANALYZER_AUTO=y
+   CONFIG_THREAD_ANALYZER_AUTO_INTERVAL=5
+   CONFIG_THREAD_ANALYZER_USE_LOG=y
+   CONFIG_THREAD_NAME=y
+   CONFIG_SCHED_THREAD_USAGE=y
+   CONFIG_SCHED_THREAD_USAGE_ALL=y
+
+.. note::
+   ``CONFIG_TRACING_CPU_STATS`` referenced in older reports is no longer
+   available. Use the thread analyzer as shown above.
+
+With :github:`64174` applied (Zephyr 3.6+), the ``usbd_workq`` thread CPU
+usage during audio playback is reduced from ~33% to ~2.4% on nRF52840/nRF5340,
+as the EasyDMA busy-wait loop was replaced with a semaphore in
+``drivers/usb/common/nrf_usbd_common/nrf_usbd_common.c``.
