@@ -18,9 +18,8 @@ LOG_MODULE_DECLARE(spi_lpspi, CONFIG_SPI_LOG_LEVEL);
 typedef enum {
 	LPSPI_TRANSFER_STATE_NULL,
 	LPSPI_TRANSFER_STATE_ONGOING,
-	LPSPI_TRANSFER_STATE_NEXT_DMA_SIZE_UPDATED,
-	LPSPI_TRANSFER_STATE_TX_DONE,
-	LPSPI_TRANSFER_STATE_RX_DONE,
+	LPSPI_TRANSFER_STATE_TX_DONE,   /* TX callback fired, waiting for RX */
+	LPSPI_TRANSFER_STATE_RX_DONE,   /* RX callback fired, waiting for TX */
 	LPSPI_TRANSFER_STATE_RX_TX_DONE,
 	LPSPI_TRANSFER_STATE_INVALID = 0xFFFFFFFFUL,
 } lpspi_transfer_state_t;
@@ -42,12 +41,10 @@ struct spi_nxp_dma_data {
 	struct spi_dma_stream dma_tx;
 
 	lpspi_transfer_state_t state;
-	/* This DMA size is used in callback function for RX and TX context update.
-	 * because of old LPSPI IP limitation, RX complete depend on next TX DMA transfer start,
-	 * so TX and RX not always start at the same time while we can only calculate DMA transfer
-	 * size once and update the buffer pointers at the same time.
+	/* next_dma_size: stashed by whichever channel callback fires first.
+	 * The second callback uses it to reload both DMA channels atomically.
 	 */
-	size_t synchronize_dma_size;
+	size_t next_dma_size;
 };
 
 /*
@@ -216,73 +213,96 @@ static void lpspi_dma_callback(const struct device *dev, void *arg, uint32_t cha
 
 	switch (dma_data->state) {
 	case LPSPI_TRANSFER_STATE_ONGOING:
-		spi_context_update_tx(ctx, 1, tx->dma_blk_cfg.block_size);
-		spi_context_update_rx(ctx, 1, rx->dma_blk_cfg.block_size);
-		/* Calculate next DMA transfer size */
-		dma_data->synchronize_dma_size = spi_context_max_continuous_chunk(ctx);
-		LOG_DBG("tx len:%d rx len:%d next dma size:%d",	ctx->tx_len, ctx->rx_len,
-			dma_data->synchronize_dma_size);
-		if (dma_data->synchronize_dma_size > 0)	{
-			ret = (channel == dma_data->dma_tx.channel)
-				      ? lpspi_dma_tx_load(spi_dev, ctx->tx_buf,
-							  dma_data->synchronize_dma_size)
-				      : lpspi_dma_rx_load(spi_dev, ctx->rx_buf,
-							  dma_data->synchronize_dma_size);
-
-			if (ret != 0) {
-				goto error;
-			}
-
-			ret = dma_start(dev, channel);
-			if (ret != 0) {
-				goto error;
-			}
-			dma_data->state = LPSPI_TRANSFER_STATE_NEXT_DMA_SIZE_UPDATED;
+		/* First of the two channel callbacks. Update only THIS channel's context
+		 * pointer — advancing the other channel's pointer here (before its DMA
+		 * has transferred anything) is the root cause of the buffer mismatch bug.
+		 * Stash the next chunk size and wait for the partner callback.
+		 */
+		if (channel == dma_data->dma_tx.channel) {
+			spi_context_update_tx(ctx, 1, tx->dma_blk_cfg.block_size);
+			dma_data->next_dma_size = spi_context_max_continuous_chunk(ctx);
+			LOG_DBG("TX done first, tx_len:%d rx_len:%d next:%d",
+				ctx->tx_len, ctx->rx_len, dma_data->next_dma_size);
+			dma_data->state = LPSPI_TRANSFER_STATE_TX_DONE;
 		} else {
-			ret = dma_stop(dev, channel);
-			if (ret != 0) {
-				goto error;
-			}
-			/* This is the end of the transfer. */
-			if (channel == dma_data->dma_tx.channel) {
-				spi_mcux_issue_TCR(spi_dev);
-				dma_data->state = LPSPI_TRANSFER_STATE_TX_DONE;
-				base->DER &= ~LPSPI_DER_TDDE_MASK;
-			} else {
-				dma_data->state = LPSPI_TRANSFER_STATE_RX_DONE;
-				base->DER &= ~LPSPI_DER_RDDE_MASK;
-			}
+			spi_context_update_rx(ctx, 1, rx->dma_blk_cfg.block_size);
+			dma_data->next_dma_size = spi_context_max_continuous_chunk(ctx);
+			LOG_DBG("RX done first, tx_len:%d rx_len:%d next:%d",
+				ctx->tx_len, ctx->rx_len, dma_data->next_dma_size);
+			dma_data->state = LPSPI_TRANSFER_STATE_RX_DONE;
 		}
-		break;
-	case LPSPI_TRANSFER_STATE_NEXT_DMA_SIZE_UPDATED:
-		ret = (channel == dma_data->dma_tx.channel)
-			      ? lpspi_dma_tx_load(spi_dev, ctx->tx_buf,
-						  dma_data->synchronize_dma_size)
-			      : lpspi_dma_rx_load(spi_dev, ctx->rx_buf,
-						  dma_data->synchronize_dma_size);
-		dma_data->synchronize_dma_size = 0;
-
-		if (ret != 0) {
-			goto error;
-		}
-
-		ret = dma_start(dev, channel);
-		if (ret != 0) {
-			goto error;
-		}
-		dma_data->state = LPSPI_TRANSFER_STATE_ONGOING;
 		break;
 
 	case LPSPI_TRANSFER_STATE_TX_DONE:
+		/* TX fired first; now RX has completed. Update RX context, then act. */
+		if (channel != dma_data->dma_rx.channel) {
+			LOG_ERR("expected RX callback in TX_DONE state, got ch %d", channel);
+			ret = -EIO;
+			goto error;
+		}
+		spi_context_update_rx(ctx, 1, rx->dma_blk_cfg.block_size);
+		dma_data->next_dma_size = spi_context_max_continuous_chunk(ctx);
+		LOG_DBG("RX done second, tx_len:%d rx_len:%d next:%d",
+			ctx->tx_len, ctx->rx_len, dma_data->next_dma_size);
+		goto reload_or_finish;
+
 	case LPSPI_TRANSFER_STATE_RX_DONE:
-		dma_data->state = LPSPI_TRANSFER_STATE_RX_TX_DONE;
-		/* TX and RX both done here. */
-		spi_context_complete(ctx, spi_dev, 0);
-		spi_context_cs_control(ctx, false);
+		/* RX fired first; now TX has completed. Update TX context, then act. */
+		if (channel != dma_data->dma_tx.channel) {
+			LOG_ERR("expected TX callback in RX_DONE state, got ch %d", channel);
+			ret = -EIO;
+			goto error;
+		}
+		spi_context_update_tx(ctx, 1, tx->dma_blk_cfg.block_size);
+		dma_data->next_dma_size = spi_context_max_continuous_chunk(ctx);
+		LOG_DBG("TX done second, tx_len:%d rx_len:%d next:%d",
+			ctx->tx_len, ctx->rx_len, dma_data->next_dma_size);
+		goto reload_or_finish;
+
+reload_or_finish:
+		/* Both TX and RX contexts are now updated. Reload both DMA channels
+		 * together for the next chunk, or finalize the transfer.
+		 */
+		if (dma_data->next_dma_size > 0) {
+			ret = lpspi_dma_tx_load(spi_dev, ctx->tx_buf, dma_data->next_dma_size);
+			if (ret != 0) {
+				goto error;
+			}
+			ret = lpspi_dma_rx_load(spi_dev, ctx->rx_buf, dma_data->next_dma_size);
+			if (ret != 0) {
+				goto error;
+			}
+			ret = dma_start(tx->dma_dev, tx->channel);
+			if (ret != 0) {
+				goto error;
+			}
+			ret = dma_start(rx->dma_dev, rx->channel);
+			if (ret != 0) {
+				goto error;
+			}
+			dma_data->next_dma_size = 0;
+			dma_data->state = LPSPI_TRANSFER_STATE_ONGOING;
+		} else {
+			/* All data transferred — tear down and complete. */
+			ret = dma_stop(tx->dma_dev, tx->channel);
+			if (ret != 0) {
+				goto error;
+			}
+			ret = dma_stop(rx->dma_dev, rx->channel);
+			if (ret != 0) {
+				goto error;
+			}
+			spi_mcux_issue_TCR(spi_dev);
+			base->DER &= ~(LPSPI_DER_TDDE_MASK | LPSPI_DER_RDDE_MASK);
+			dma_data->next_dma_size = 0;
+			dma_data->state = LPSPI_TRANSFER_STATE_RX_TX_DONE;
+			spi_context_complete(ctx, spi_dev, 0);
+			spi_context_cs_control(ctx, false);
+		}
 		break;
 
 	default:
-		LOG_ERR("unknown spi stransfer state:%d", dma_data->state);
+		LOG_ERR("unknown spi transfer state:%d", dma_data->state);
 		ret = -EIO;
 		goto error;
 	}
@@ -329,8 +349,8 @@ static int transceive_dma(const struct device *dev, const struct spi_config *spi
 	base->FCR = LPSPI_FCR_TXWATER(0) | LPSPI_FCR_RXWATER(0);
 	spi_context_buffers_setup(&data->ctx, tx_bufs, rx_bufs, 1);
 
-	/* Set next dma size is invalid. */
-	dma_data->synchronize_dma_size = 0;
+	/* Reset synchronization state before starting a new transfer. */
+	dma_data->next_dma_size = 0;
 	dma_data->state = LPSPI_TRANSFER_STATE_NULL;
 
 	/* Load dma block */
